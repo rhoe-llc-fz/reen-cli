@@ -153,6 +153,10 @@ function connectToConference(confId, runner, label = '') {
 
         console.log(`  [${tag}] [${msg.author}] ${msg.content?.slice(0, 100)}`);
 
+        // Игнорируем сообщения от моделей — маршрутизируем только от пользователей
+        const isModelMessage = enabledModels.includes(msg.author) || msg.role === 'assistant';
+        if (isModelMessage) return;
+
         // Маршрутизация по @mentions
         const mentions = msg.mentions || [];
         for (const model of enabledModels) {
