@@ -157,10 +157,6 @@ function connectToConference(confId, runner, label = '') {
 
         console.log(`  [${tag}] [${msg.author}] ${msg.content?.slice(0, 100)}`);
 
-        // Игнорируем сообщения от моделей — маршрутизируем только от пользователей
-        const isModelMessage = enabledModels.includes(msg.author) || msg.role === 'assistant';
-        if (isModelMessage) return;
-
         // Проверяем состояние конференции (pause/stop блокируют роутинг)
         const state = confStates.get(confId);
         if (state === 'paused' || state === 'stopped') {
@@ -168,16 +164,27 @@ function connectToConference(confId, runner, label = '') {
           return;
         }
 
+        // Определяем автора сообщения
+        const msgAuthor = (msg.author || '').toLowerCase();
+
         // Маршрутизация по @mentions
         const mentions = msg.mentions || [];
         for (const model of enabledModels) {
+          // Модель не отвечает сама себе (anti-self-loop)
+          if (model === msgAuthor) continue;
+
           if (mentions.includes(model) || mentions.includes('all')) {
             console.log(`  [${tag}] -> ${model}...`);
             ws.send({ type: 'status', model, state: 'generating' });
 
             try {
               const response = await runner.run(model, history);
-              ws.send({ type: 'message', content: response, mentions: [], author: model });
+              // Парсим @mentions из ответа модели для продолжения цепочки
+              const mentionRe = /@(claude|codex|gemini|all)\b/gi;
+              const responseMentions = [...new Set(
+                [...response.matchAll(mentionRe)].map(m => m[1].toLowerCase())
+              )];
+              ws.send({ type: 'message', content: response, mentions: responseMentions, author: model });
               console.log(`  [${tag}] <- [${model}] ${response.slice(0, 100)}${response.length > 100 ? '...' : ''}`);
             } catch (err) {
               if (err.message !== '__CANCELLED__') {
