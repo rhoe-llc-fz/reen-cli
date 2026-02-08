@@ -169,11 +169,15 @@ function connectToConference(confId, runner, label = '') {
 
         // Маршрутизация по @mentions
         const mentions = msg.mentions || [];
+        let roundCount = 0;
         for (const model of enabledModels) {
           // Модель не отвечает сама себе (anti-self-loop)
           if (model === msgAuthor) continue;
 
           if (mentions.includes(model) || mentions.includes('all')) {
+            // Перепроверяем состояние перед каждой моделью (могли нажать Stop/Pause)
+            if (confStates.get(confId) !== 'playing') break;
+
             console.log(`  [${tag}] -> ${model}...`);
             ws.send({ type: 'status', model, state: 'generating' });
 
@@ -186,6 +190,7 @@ function connectToConference(confId, runner, label = '') {
               )];
               ws.send({ type: 'message', content: response, mentions: responseMentions, author: model });
               console.log(`  [${tag}] <- [${model}] ${response.slice(0, 100)}${response.length > 100 ? '...' : ''}`);
+              roundCount++;
             } catch (err) {
               if (err.message !== '__CANCELLED__') {
                 console.error(`  [${tag}] x [${model}] ${err.message}`);
@@ -195,6 +200,13 @@ function connectToConference(confId, runner, label = '') {
 
             ws.send({ type: 'status', model, state: 'idle' });
           }
+        }
+
+        // Автопауза после раунда — ждём Play для следующего
+        if (roundCount > 0 && confStates.get(confId) === 'playing') {
+          console.log(`  [${tag}] ⏸ Round done (${roundCount} models), auto-pause`);
+          confStates.set(confId, 'paused');
+          ws.send({ type: 'control', action: 'paused' });
         }
       } else if (msg.type === 'system') {
         console.log(`  [${tag}] * ${msg.content}`);
