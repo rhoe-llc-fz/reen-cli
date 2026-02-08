@@ -116,6 +116,9 @@ async function apiCall(method, path, data = null) {
 
 const enabledModels = modelsStr.split(',').map(m => m.trim().toLowerCase());
 
+// Глобальное состояние конференций: paused/stopped предотвращает роутинг к моделям
+const confStates = new Map(); // confId -> 'playing' | 'paused' | 'stopped'
+
 /**
  * Подключает модели к одной конференции.
  * Возвращает { ws, runner, history } для управления.
@@ -126,6 +129,7 @@ function connectToConference(confId, runner, label = '') {
   const tag = label || confId.slice(-6);
 
   let history = [];
+  confStates.set(confId, 'playing');
 
   // Подгружаем историю через REST
   apiCall('GET', `/api/conferences/${confId}?limit=${contextSize}`)
@@ -157,6 +161,13 @@ function connectToConference(confId, runner, label = '') {
         const isModelMessage = enabledModels.includes(msg.author) || msg.role === 'assistant';
         if (isModelMessage) return;
 
+        // Проверяем состояние конференции (pause/stop блокируют роутинг)
+        const state = confStates.get(confId);
+        if (state === 'paused' || state === 'stopped') {
+          console.log(`  [${tag}] ⏸ Skipping (${state})`);
+          return;
+        }
+
         // Маршрутизация по @mentions
         const mentions = msg.mentions || [];
         for (const model of enabledModels) {
@@ -183,6 +194,15 @@ function connectToConference(confId, runner, label = '') {
       } else if (msg.type === 'cancel') {
         console.log(`  [${tag}] x Cancel: ${msg.target}`);
         runner.cancel(msg.target);
+      } else if (msg.type === 'control') {
+        // Управление конференцией: play/pause/stop
+        const action = msg.action;
+        console.log(`  [${tag}] ⚡ Control: ${action}`);
+        confStates.set(confId, action);
+        if (action === 'stopped') {
+          // Stop = отменить все текущие генерации
+          runner.cancelAll();
+        }
       }
     },
 
