@@ -8,6 +8,31 @@
 
 import { WSClient } from './lib/ws-client.mjs';
 import { ModelRunner } from './lib/model-runner.mjs';
+import { writeFileSync, unlinkSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// --- Lockfile для предотвращения дублирования ---
+const LOCKFILE = join(tmpdir(), 'reen-cli-daemon.lock');
+
+function acquireLock() {
+  if (existsSync(LOCKFILE)) {
+    try {
+      const pid = parseInt(readFileSync(LOCKFILE, 'utf-8').trim(), 10);
+      // Проверяем жив ли процесс
+      process.kill(pid, 0); // signal 0 = проверка без убийства
+      console.error(`  ERROR: Daemon already running (PID ${pid}). Kill it first or use 'connect'.`);
+      process.exit(1);
+    } catch {
+      // Процесс мёртв — stale lockfile, перезаписываем
+    }
+  }
+  writeFileSync(LOCKFILE, String(process.pid));
+}
+
+function releaseLock() {
+  try { unlinkSync(LOCKFILE); } catch {}
+}
 
 const HELP = `
 reen-cli — connect local AI models to REEN conferences
@@ -232,6 +257,7 @@ async function cmdConnect() {
 }
 
 async function cmdDaemon() {
+  acquireLock();
   const runner = new ModelRunner({ contextSize });
   const connections = new Map(); // confId -> { ws, history }
 
@@ -273,14 +299,18 @@ async function cmdDaemon() {
   // Периодический опрос новых конференций
   setInterval(syncConferences, pollInterval * 1000);
 
-  process.on('SIGINT', () => {
+  function shutdown() {
     console.log('\n  Shutting down daemon...');
     for (const [, conn] of connections) {
       conn.ws.close();
     }
     runner.cancelAll();
+    releaseLock();
     process.exit(0);
-  });
+  }
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // --- Main ---
