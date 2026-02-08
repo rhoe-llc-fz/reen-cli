@@ -14,26 +14,28 @@ reen-cli — connect local AI models to REEN conferences
 
 Usage:
   reen-cli connect <conference_id_or_url> --token <token> [--models claude,codex,gemini]
+  reen-cli daemon --token <token> [--models claude,codex,gemini] [--poll 15]
   reen-cli list --token <token> [--server <url>]
   reen-cli create --title "Title" --token <token> [--server <url>]
 
 Commands:
-  connect   Connect to a conference and route @mentions to local AI models
+  connect   Connect to a single conference
+  daemon    Connect to ALL conferences, auto-join new ones
   list      List your conferences
   create    Create a new conference
 
 Options:
-  --token, -t     REEN API token (reen_XXX)
+  --token, -t     REEN API token (reen_XXX or JWT)
   --models, -m    Comma-separated models to enable (default: claude,codex,gemini)
   --server, -s    REEN server URL (default: https://backend.reen.tech)
   --context, -c   Number of context messages for AI (default: 20)
+  --poll, -p      Poll interval in seconds for daemon mode (default: 15)
   --help, -h      Show this help
 
 Examples:
   reen-cli connect conf_abc123 -t reen_XXX
-  reen-cli connect wss://backend.reen.tech/ws/conference/conf_abc123 -t reen_XXX
+  reen-cli daemon -t reen_XXX -s http://localhost:5012
   reen-cli list -t reen_XXX
-  reen-cli create --title "Architecture Review" -t reen_XXX
 `;
 
 // --- Argument parsing ---
@@ -62,6 +64,7 @@ const token = getFlag(restArgs, ['--token', '-t']);
 const server = getFlag(restArgs, ['--server', '-s']) || 'https://backend.reen.tech';
 const modelsStr = getFlag(restArgs, ['--models', '-m']) || 'claude,codex,gemini';
 const contextSize = parseInt(getFlag(restArgs, ['--context', '-c']) || '20', 10);
+const pollInterval = parseInt(getFlag(restArgs, ['--poll', '-p']) || '15', 10);
 
 if (!token) {
   console.error('Error: --token is required');
@@ -82,6 +85,90 @@ async function apiCall(method, path, data = null) {
   if (data) opts.body = JSON.stringify(data);
   const res = await fetch(url, opts);
   return res.json();
+}
+
+// --- Shared: connect to one conference ---
+
+const enabledModels = modelsStr.split(',').map(m => m.trim().toLowerCase());
+
+/**
+ * Подключает модели к одной конференции.
+ * Возвращает { ws, runner, history } для управления.
+ */
+function connectToConference(confId, runner, label = '') {
+  const wsServer = server.replace(/^http/, 'ws');
+  const wsUrl = `${wsServer}/ws/conference/${confId}?token=${encodeURIComponent(token)}`;
+  const tag = label || confId.slice(-6);
+
+  let history = [];
+
+  // Подгружаем историю через REST
+  apiCall('GET', `/api/conferences/${confId}?limit=${contextSize}`)
+    .then(data => {
+      history = data.messages || [];
+      console.log(`  [${tag}] Loaded ${history.length} messages`);
+    })
+    .catch(() => {
+      console.log(`  [${tag}] Could not load history`);
+    });
+
+  const ws = new WSClient(wsUrl, {
+    onOpen: () => {
+      console.log(`  [${tag}] Connected`);
+      ws.send({
+        type: 'capabilities',
+        models: Object.fromEntries(enabledModels.map(m => [m, true]))
+      });
+    },
+
+    onMessage: async (msg) => {
+      if (msg.type === 'message') {
+        history.push(msg);
+        if (history.length > contextSize) history = history.slice(-contextSize);
+
+        console.log(`  [${tag}] [${msg.author}] ${msg.content?.slice(0, 100)}`);
+
+        // Маршрутизация по @mentions
+        const mentions = msg.mentions || [];
+        for (const model of enabledModels) {
+          if (mentions.includes(model) || mentions.includes('all')) {
+            console.log(`  [${tag}] -> ${model}...`);
+            ws.send({ type: 'status', model, state: 'generating' });
+
+            try {
+              const response = await runner.run(model, history);
+              ws.send({ type: 'message', content: response, mentions: [], author: model });
+              console.log(`  [${tag}] <- [${model}] ${response.slice(0, 100)}${response.length > 100 ? '...' : ''}`);
+            } catch (err) {
+              if (err.message !== '__CANCELLED__') {
+                console.error(`  [${tag}] x [${model}] ${err.message}`);
+                ws.send({ type: 'message', content: `[${model} error] ${err.message}`, mentions: [], author: model });
+              }
+            }
+
+            ws.send({ type: 'status', model, state: 'idle' });
+          }
+        }
+      } else if (msg.type === 'system') {
+        console.log(`  [${tag}] * ${msg.content}`);
+      } else if (msg.type === 'cancel') {
+        console.log(`  [${tag}] x Cancel: ${msg.target}`);
+        runner.cancel(msg.target);
+      }
+    },
+
+    onClose: (code, reason) => {
+      if (code === 4001 || code === 4004) {
+        console.log(`  [${tag}] Disconnected (${code})`);
+      }
+    },
+
+    onError: (err) => {
+      console.error(`  [${tag}] WS Error: ${err.message}`);
+    }
+  });
+
+  return { ws, history };
 }
 
 // --- Commands ---
@@ -109,7 +196,7 @@ async function cmdCreate() {
   const data = await apiCall('POST', '/api/conferences', { title });
   if (data.success) {
     console.log(`Conference created: ${data.conference.id}`);
-    console.log(`Connect: reen-cli connect ${data.conference.id} -t ${token}`);
+    console.log(`Connect: reen-cli connect ${data.conference.id} -t <token>`);
   } else {
     console.error('Failed to create conference:', data);
   }
@@ -122,98 +209,75 @@ async function cmdConnect() {
     process.exit(1);
   }
 
-  // Resolve confId and wsUrl
-  let confId, wsUrl;
+  let confId;
   if (target.startsWith('ws://') || target.startsWith('wss://')) {
-    wsUrl = target;
     confId = target.split('/').pop().split('?')[0];
   } else {
     confId = target;
-    const wsServer = server.replace(/^http/, 'ws');
-    wsUrl = `${wsServer}/ws/conference/${confId}?token=${encodeURIComponent(token)}`;
   }
 
-  if (!wsUrl.includes('token=')) {
-    wsUrl += (wsUrl.includes('?') ? '&' : '?') + `token=${encodeURIComponent(token)}`;
-  }
-
-  const enabledModels = modelsStr.split(',').map(m => m.trim().toLowerCase());
   const runner = new ModelRunner({ contextSize });
 
   console.log(`\n  Connecting to conference: ${confId}`);
-  console.log(`  Models: ${enabledModels.join(', ')}`);
-  console.log(`  Context: last ${contextSize} messages\n`);
+  console.log(`  Models: ${enabledModels.join(', ')}\n`);
 
-  // Load history for context
-  let history = [];
-  try {
-    const data = await apiCall('GET', `/api/conferences/${confId}?limit=${contextSize}`);
-    history = data.messages || [];
-    console.log(`  Loaded ${history.length} messages from history\n`);
-  } catch (e) {
-    console.log('  Could not load history, starting fresh\n');
-  }
+  const conn = connectToConference(confId, runner);
 
-  const ws = new WSClient(wsUrl, {
-    onOpen: () => {
-      console.log('  Connected!\n');
-      ws.send({
-        type: 'capabilities',
-        models: Object.fromEntries(enabledModels.map(m => [m, true]))
-      });
-    },
-
-    onMessage: async (msg) => {
-      if (msg.type === 'message') {
-        history.push(msg);
-        if (history.length > contextSize) history = history.slice(-contextSize);
-
-        console.log(`  [${msg.author}] ${msg.content?.slice(0, 120)}`);
-
-        // Check @mentions and route to models
-        const mentions = msg.mentions || [];
-        for (const model of enabledModels) {
-          if (mentions.includes(model) || mentions.includes('all')) {
-            console.log(`  -> Routing to ${model}...`);
-
-            ws.send({ type: 'status', model, state: 'generating' });
-
-            try {
-              const response = await runner.run(model, history);
-              ws.send({ type: 'message', content: response, mentions: [] });
-              console.log(`  <- [${model}] ${response.slice(0, 120)}${response.length > 120 ? '...' : ''}`);
-            } catch (err) {
-              console.error(`  x [${model}] Error: ${err.message}`);
-              ws.send({ type: 'message', content: `[${model} error] ${err.message}`, mentions: [] });
-            }
-
-            ws.send({ type: 'status', model, state: 'idle' });
-          }
-        }
-      } else if (msg.type === 'system') {
-        console.log(`  * ${msg.content}`);
-      } else if (msg.type === 'cancel') {
-        console.log(`  x Cancel requested for ${msg.target}`);
-        runner.cancel(msg.target);
-      }
-    },
-
-    onClose: (code, reason) => {
-      console.log(`\n  Disconnected (${code}: ${reason})`);
-      if (code !== 4001 && code !== 4004) {
-        console.log('  Reconnecting in 3s...');
-      }
-    },
-
-    onError: (err) => {
-      console.error('  WS Error:', err.message);
-    }
-  });
-
-  // Graceful shutdown
   process.on('SIGINT', () => {
     console.log('\n  Shutting down...');
-    ws.close();
+    conn.ws.close();
+    runner.cancelAll();
+    process.exit(0);
+  });
+}
+
+async function cmdDaemon() {
+  const runner = new ModelRunner({ contextSize });
+  const connections = new Map(); // confId -> { ws, history }
+
+  console.log(`\n  DAEMON MODE`);
+  console.log(`  Models: ${enabledModels.join(', ')}`);
+  console.log(`  Poll: every ${pollInterval}s\n`);
+
+  async function syncConferences() {
+    try {
+      const data = await apiCall('GET', '/api/conferences');
+      const confs = data.conferences || [];
+
+      for (const conf of confs) {
+        if (!connections.has(conf.id)) {
+          const label = conf.title?.slice(0, 20) || conf.id.slice(-6);
+          console.log(`  + Joining: ${conf.id} (${label})`);
+          const conn = connectToConference(conf.id, runner, label);
+          connections.set(conf.id, conn);
+        }
+      }
+
+      // Убираем удалённые конференции
+      const activeIds = new Set(confs.map(c => c.id));
+      for (const [confId, conn] of connections) {
+        if (!activeIds.has(confId)) {
+          console.log(`  - Leaving: ${confId}`);
+          conn.ws.close();
+          connections.delete(confId);
+        }
+      }
+    } catch (err) {
+      console.error(`  Poll error: ${err.message}`);
+    }
+  }
+
+  // Первичное подключение
+  await syncConferences();
+
+  // Периодический опрос новых конференций
+  setInterval(syncConferences, pollInterval * 1000);
+
+  process.on('SIGINT', () => {
+    console.log('\n  Shutting down daemon...');
+    for (const [, conn] of connections) {
+      conn.ws.close();
+    }
     runner.cancelAll();
     process.exit(0);
   });
@@ -223,8 +287,9 @@ async function cmdConnect() {
 
 switch (command) {
   case 'connect': await cmdConnect(); break;
-  case 'list': await cmdList(); break;
-  case 'create': await cmdCreate(); break;
+  case 'daemon':  await cmdDaemon(); break;
+  case 'list':    await cmdList(); break;
+  case 'create':  await cmdCreate(); break;
   default:
     console.error(`Unknown command: ${command}`);
     console.log(HELP);
