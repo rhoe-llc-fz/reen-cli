@@ -157,25 +157,49 @@ function connectToConference(confId, runner, label = '') {
 
         console.log(`  [${tag}] [${msg.author}] ${msg.content?.slice(0, 100)}`);
 
-        // Проверяем состояние конференции (pause/stop блокируют роутинг)
-        const state = confStates.get(confId);
-        if (state === 'paused' || state === 'stopped') {
-          console.log(`  [${tag}] ⏸ Skipping (${state})`);
-          return;
-        }
-
         // Определяем автора сообщения
         const msgAuthor = (msg.author || '').toLowerCase();
+        const isFromModel = enabledModels.includes(msgAuthor);
 
-        // Маршрутизация по @mentions
-        const mentions = msg.mentions || [];
-        let roundCount = 0;
-        for (const model of enabledModels) {
-          // Модель не отвечает сама себе (anti-self-loop)
-          if (model === msgAuthor) continue;
+        // Проверяем состояние конференции
+        const state = confStates.get(confId);
+        if (state === 'stopped') {
+          console.log(`  [${tag}] ⏸ Skipping (stopped)`);
+          return;
+        }
+        // Пауза: сообщения от моделей игнорируются, от пользователя — снимают паузу
+        if (state === 'paused') {
+          if (isFromModel) {
+            console.log(`  [${tag}] ⏸ Skipping model msg (paused)`);
+            return;
+          }
+          // Пользователь написал — снимаем паузу автоматически
+          console.log(`  [${tag}] ▶ User message, resuming from pause`);
+          confStates.set(confId, 'playing');
+          ws.send({ type: 'control', action: 'playing' });
+        }
 
-          if (mentions.includes(model) || mentions.includes('all')) {
-            // Перепроверяем состояние перед каждой моделью (могли нажать Stop/Pause)
+        // Маршрутизация: цепочка раундов (макс 5), последовательно claude → codex → gemini
+        // Каждая модель видит ответы предыдущих. @mentions в ответах запускают следующий раунд.
+        const mentionRe = /@(claude|codex|gemini|all)\b/gi;
+        const MAX_ROUNDS = 5;
+        let pendingMentions = msg.mentions || [];
+        let lastAuthor = msgAuthor;
+        let totalResponses = 0;
+
+        for (let round = 0; round < MAX_ROUNDS; round++) {
+          if (confStates.get(confId) !== 'playing') break;
+          if (pendingMentions.length === 0) break;
+
+          const roundMentions = [...pendingMentions];
+          pendingMentions = []; // Собираем @mentions из ответов этого раунда
+          let roundResponded = 0;
+
+          console.log(`  [${tag}] 📢 Round ${round + 1}, mentions: [${roundMentions.join(', ')}]`);
+
+          for (const model of enabledModels) {
+            if (model === lastAuthor && round > 0) continue; // Не отвечаем сами себе в follow-up раундах
+            if (!roundMentions.includes(model) && !roundMentions.includes('all')) continue;
             if (confStates.get(confId) !== 'playing') break;
 
             console.log(`  [${tag}] -> ${model}...`);
@@ -183,28 +207,45 @@ function connectToConference(confId, runner, label = '') {
 
             try {
               const response = await runner.run(model, history);
-              // Парсим @mentions из ответа модели для продолжения цепочки
-              const mentionRe = /@(claude|codex|gemini|all)\b/gi;
+              if (confStates.get(confId) !== 'playing') {
+                ws.send({ type: 'status', model, state: 'idle' });
+                break;
+              }
               const responseMentions = [...new Set(
                 [...response.matchAll(mentionRe)].map(m => m[1].toLowerCase())
               )];
-              ws.send({ type: 'message', content: response, mentions: responseMentions, author: model });
+              const responseMsg = { type: 'message', content: response, mentions: responseMentions, author: model };
+              ws.send(responseMsg);
+              history.push(responseMsg);
               console.log(`  [${tag}] <- [${model}] ${response.slice(0, 100)}${response.length > 100 ? '...' : ''}`);
-              roundCount++;
+              roundResponded++;
+              totalResponses++;
+              lastAuthor = model;
+
+              // Собираем @mentions для следующего раунда
+              for (const m of responseMentions) {
+                if (!pendingMentions.includes(m)) pendingMentions.push(m);
+              }
             } catch (err) {
               if (err.message !== '__CANCELLED__') {
                 console.error(`  [${tag}] x [${model}] ${err.message}`);
-                ws.send({ type: 'message', content: `[${model} error] ${err.message}`, mentions: [], author: model });
+                const shortErr = err.message.split('\n')[0].slice(0, 120);
+                const friendlyMsg = /429|rate.?limit|capacity/i.test(shortErr)
+                  ? `${model} — rate limit, попробуем позже`
+                  : `${model} — ошибка: ${shortErr}`;
+                ws.send({ type: 'message', content: friendlyMsg, mentions: [], author: 'system', role: 'system' });
               }
             }
-
             ws.send({ type: 'status', model, state: 'idle' });
           }
+
+          if (roundResponded === 0) break;
+          console.log(`  [${tag}] ✓ Round ${round + 1} done (${roundResponded} models)`);
         }
 
-        // Автопауза после раунда — ждём Play для следующего
-        if (roundCount > 0 && confStates.get(confId) === 'playing') {
-          console.log(`  [${tag}] ⏸ Round done (${roundCount} models), auto-pause`);
+        // Автопауза после всех раундов
+        if (totalResponses > 0 && confStates.get(confId) === 'playing') {
+          console.log(`  [${tag}] ⏸ Chain done (${totalResponses} total responses), auto-pause`);
           confStates.set(confId, 'paused');
           ws.send({ type: 'control', action: 'paused' });
         }
@@ -216,11 +257,60 @@ function connectToConference(confId, runner, label = '') {
       } else if (msg.type === 'control') {
         // Управление конференцией: play/pause/stop
         const action = msg.action;
+        const prevState = confStates.get(confId);
         console.log(`  [${tag}] ⚡ Control: ${action}`);
         confStates.set(confId, action);
         if (action === 'stopped') {
           // Stop = отменить все текущие генерации
           runner.cancelAll();
+        }
+        // Play после паузы — проверяем последнее сообщение на необработанные @mentions
+        if (action === 'playing' && prevState === 'paused' && history.length > 0) {
+          const lastMsg = history[history.length - 1];
+          const lastAuthor = (lastMsg.author || '').toLowerCase();
+          // Парсим mentions из последнего сообщения
+          const mentionRe = /@(claude|codex|gemini|all)\b/gi;
+          const textMentions = [...new Set(
+            [...(lastMsg.content || '').matchAll(mentionRe)].map(m => m[1].toLowerCase())
+          )];
+          const mentions = [...new Set([...(lastMsg.mentions || []), ...textMentions])];
+          if (mentions.length > 0) {
+            console.log(`  [${tag}] ▶ Resuming: processing @mentions from last msg by ${lastAuthor}`);
+            let roundCount = 0;
+            for (const model of enabledModels) {
+              if (model === lastAuthor) continue;
+              if (mentions.includes(model) || mentions.includes('all')) {
+                if (confStates.get(confId) !== 'playing') break;
+                console.log(`  [${tag}] -> ${model}...`);
+                ws.send({ type: 'status', model, state: 'generating' });
+                try {
+                  const response = await runner.run(model, history);
+                  const responseMentions = [...new Set(
+                    [...response.matchAll(mentionRe)].map(m => m[1].toLowerCase())
+                  )];
+                  ws.send({ type: 'message', content: response, mentions: responseMentions, author: model });
+                  history.push({ type: 'message', content: response, mentions: responseMentions, author: model });
+                  console.log(`  [${tag}] <- [${model}] ${response.slice(0, 80)}...`);
+                  roundCount++;
+                } catch (err) {
+                  if (err.message !== '__CANCELLED__') {
+                    console.error(`  [${tag}] x [${model}] ${err.message}`);
+                    const shortErr = err.message.split('\n')[0].slice(0, 120);
+                    const friendlyMsg = /429|rate.?limit|capacity/i.test(shortErr)
+                      ? `${model} — rate limit, попробуем позже`
+                      : `${model} — ошибка: ${shortErr}`;
+                    ws.send({ type: 'message', content: friendlyMsg, mentions: [], author: 'system', role: 'system' });
+                  }
+                }
+                ws.send({ type: 'status', model, state: 'idle' });
+              }
+            }
+            if (roundCount > 0 && confStates.get(confId) === 'playing') {
+              console.log(`  [${tag}] ⏸ Round done (${roundCount} models), auto-pause`);
+              confStates.set(confId, 'paused');
+              ws.send({ type: 'control', action: 'paused' });
+            }
+          }
         }
       }
     },

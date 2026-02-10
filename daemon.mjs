@@ -10,7 +10,7 @@ import { ModelRunner } from './lib/model-runner.mjs';
 const token = process.env.JWT || process.argv[2];
 const server = process.env.SERVER || process.argv[3] || 'http://127.0.0.1:5012';
 const modelsStr = process.env.MODELS || 'claude,codex,gemini';
-const contextSize = 20;
+const contextSize = 100;
 const pollInterval = 10000; // 10 секунд
 
 if (!token) {
@@ -80,15 +80,29 @@ async function connectToConference(confId, title) {
         history.push(msg);
         if (history.length > contextSize) history = history.slice(-contextSize);
 
-        const mentions = msg.mentions || [];
+        // Парсинг @mentions — из поля mentions ИЛИ из текста сообщения
+        const mentionRe = /@(claude|codex|gemini|all)\b/gi;
+        const textMentions = [...new Set(
+          [...(msg.content || '').matchAll(mentionRe)].map(m => m[1].toLowerCase())
+        )];
+        const mentions = [...new Set([...(msg.mentions || []), ...textMentions])];
+
+        // Anti-self-loop: модель не отвечает на своё же сообщение
+        const msgAuthor = (msg.author || '').toLowerCase();
+
         for (const model of enabledModels) {
+          if (model === msgAuthor) continue;
           if (mentions.includes(model) || mentions.includes('all')) {
             console.log(`  [${title}] @${model} from ${msg.author}`);
             ws.send({ type: 'status', model, state: 'generating' });
             try {
               const response = await runner.run(model, history);
-              ws.send({ type: 'message', content: response, mentions: [], author: model });
-              console.log(`  [${title}] ${model} responded (${response.length} chars)`);
+              // Парсим @mentions из ответа модели для цепочки model-to-model
+              const responseMentions = [...new Set(
+                [...response.matchAll(mentionRe)].map(m => m[1].toLowerCase())
+              )];
+              ws.send({ type: 'message', content: response, mentions: responseMentions, author: model });
+              console.log(`  [${title}] ${model} responded (${response.length} chars, mentions: ${responseMentions.join(',') || 'none'})`);
             } catch (err) {
               if (err.message === '__CANCELLED__') {
                 console.log(`  [${title}] ${model} cancelled`);
