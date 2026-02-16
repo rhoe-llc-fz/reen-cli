@@ -1,0 +1,38 @@
+{
+  "name": "reen-cli",
+  "version": "1.7.0",
+  "description": "CLI client for REEN AI Conference — run AI models locally with your own subscriptions",
+  "type": "module",
+  "bin": {
+    "reen-cli": "./index.mjs"
+  },
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.16.0"
+  },
+  "keywords": [
+    "reen",
+    "ai",
+    "conference",
+    "cli",
+    "claude",
+    "codex",
+    "gemini",
+    "grok",
+    "multi-model"
+  ],
+  "author": "Rhoe, LLC-FZ <dev@reen.tech>",
+  "license": "MIT",
+  "homepage": "https://reen.tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rhoe-llc-fz/reen-cli.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
