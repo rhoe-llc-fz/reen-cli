@@ -1,147 +1,78 @@
 #!/usr/bin/env node
 /**
- * reen-cli — CLI клиент для REEN AI Conference
+ * reen-cli daemon — auto-connect to all conferences
  *
- * Подключается к backend.reen.tech по WebSocket, слушает @mentions,
- * роутит к локальным AI CLI (claude/codex/gemini/grok).
+ * Polls API, connects to new/active conferences via WebSocket,
+ * listens for @mentions, routes to AI CLI (claude/gpt/gemini/grok).
  *
- * BYOK: API ключи и CLI подписки остаются на вашей машине.
+ * Standalone: all code in a single file (ws + node-pty).
  *
- * Команды:
- *   reen-cli daemon  --token reen_XXX                  # Все конференции (рекомендуется)
- *   reen-cli connect <conf_id> --token reen_XXX        # Одна конференция
- *   reen-cli list    --token reen_XXX                  # Список конференций
- *   reen-cli create  --title "Title" --token reen_XXX  # Создать конференцию
- *
- * Env vars:
- *   REEN_TOKEN / JWT    — токен авторизации
- *   REEN_BACKEND        — URL бэкенда (default: https://backend.reen.tech)
- *   MODELS              — модели через запятую (default: claude,codex,gemini,grok)
- *
- * Подробнее: https://reen.tech
- *
- * (c) Rhoe, LLC-FZ
+ * Usage:
+ *   node reen/scripts/daemon.mjs --token reen_XXX --backend https://test-api.reen.tech
+ *   node reen/scripts/daemon.mjs --token reen_XXX --backend https://backend.reen.tech --models claude
+ *   JWT=reen_XXX SERVER=https://test-api.reen.tech node reen/scripts/daemon.mjs
  */
 
 import WebSocket from 'ws';
 import pty from 'node-pty';
-import { existsSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
+import { execSync } from 'child_process';
+import { mkdirSync } from 'fs';
 
 // ═══════════════════════════════════════════
-// §1. Конфигурация
+// §1. Configuration
 // ═══════════════════════════════════════════
-
-const VERSION = '1.7.0';
-const LOCKFILE = join(tmpdir(), 'reen-cli-daemon.lock');
-const SANDBOX_DIR = join(tmpdir(), 'reen-sandbox');
 
 const DEFAULTS = {
-  backend: 'https://backend.reen.tech',
-  models: ['claude', 'codex', 'gemini', 'grok'],
+  backend: 'http://localhost:5012',
+  models: ['claude', 'gpt', 'gemini', 'grok'],
   recentBufferSize: 50,
   summaryInterval: 10,
   typingIntervalMs: 5000,
   claudeTimeoutMs: 120000,
-  codexTimeoutMs: 180000,
+  gptTimeoutMs: 180000,
   geminiTimeoutMs: 120000,
   grokTimeoutMs: 120000,
-  pollIntervalMs: 15000,
+  pollIntervalMs: 10000,
 };
 
 function parseArgs() {
   const args = process.argv.slice(2);
   const config = { ...DEFAULTS };
 
-  // Команда (первый non-flag аргумент)
-  config.command = null;
-  config.commandArg = null;
-
-  // Env vars
+  // Env vars take priority
   config.token = process.env.JWT || process.env.REEN_TOKEN || null;
-  config.backend = process.env.REEN_BACKEND || process.env.SERVER || config.backend;
+  config.backend = process.env.SERVER || process.env.REEN_BACKEND || config.backend;
   if (process.env.MODELS) config.models = process.env.MODELS.split(',').map(m => m.trim());
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
-      case '--token': case '-t': config.token = args[++i]; break;
-      case '--backend': case '--server': case '-s': config.backend = args[++i]; break;
-      case '--models': case '-m': config.models = args[++i].split(',').map(m => m.trim()); break;
-      case '--poll': case '-p': config.pollIntervalMs = parseInt(args[++i]) * 1000; break;
-      case '--context': case '-c': config.recentBufferSize = parseInt(args[++i]); break;
-      case '--verbose': case '-v': config.verbose = true; break;
-      case '--version': console.log(`reen-cli v${VERSION}`); process.exit(0);
-      case '--help': case '-h': printHelp(); process.exit(0);
-      case 'daemon': case 'connect': case 'list': case 'create':
-        config.command = args[i];
-        // Следующий аргумент может быть позиционным
-        if (args[i + 1] && !args[i + 1].startsWith('-')) config.commandArg = args[++i];
-        break;
-      case '--title': config.title = args[++i]; break;
-      default:
-        if (!args[i].startsWith('-') && !config.command) {
-          config.command = args[i];
-        }
+      case '--token': config.token = args[++i]; break;
+      case '--backend': config.backend = args[++i]; break;
+      case '--models': config.models = args[++i].split(',').map(m => m.trim()); break;
+      case '--poll': config.pollIntervalMs = parseInt(args[++i]) * 1000; break;
+      case '--verbose': config.verbose = true; break;
+      case '--help':
+        console.log('Usage: node daemon.mjs --token <reen_XXX> [--backend URL] [--models claude,gpt,gemini] [--poll 10] [--verbose]');
+        process.exit(0);
     }
   }
 
-  // Default command = daemon
-  if (!config.command) config.command = 'daemon';
-
-  if (!config.token && config.command !== '--help') {
-    console.error('Требуется токен: --token <reen_XXX> или переменная REEN_TOKEN');
+  if (!config.token) {
+    console.error('Required: --token <reen_XXX> or JWT=<token>');
     process.exit(1);
   }
 
   return config;
 }
 
-function printHelp() {
-  console.log(`
-  reen-cli v${VERSION} — CLI для REEN AI Conference
-
-  Использование:
-    reen-cli daemon  [options]              Подключиться ко ВСЕМ конференциям (рекомендуется)
-    reen-cli connect <conf_id> [options]    Подключиться к одной конференции
-    reen-cli list    [options]              Список конференций
-    reen-cli create  --title "Title" [opts] Создать конференцию
-
-  Опции:
-    --token, -t <token>     REEN API токен (reen_XXX или JWT) [обязательно]
-    --backend, -s <url>     URL бэкенда [default: https://backend.reen.tech]
-    --models, -m <list>     Модели через запятую [default: claude,codex,gemini,grok]
-    --poll, -p <seconds>    Интервал опроса для daemon [default: 15]
-    --context, -c <number>  Размер контекста сообщений [default: 50]
-    --verbose, -v           Подробный вывод
-    --version               Версия
-    --help, -h              Справка
-
-  Переменные окружения:
-    REEN_TOKEN / JWT        Токен авторизации
-    REEN_BACKEND / SERVER   URL бэкенда
-    MODELS                  Модели через запятую
-
-  Примеры:
-    reen-cli daemon --token reen_abc123
-    reen-cli daemon --token reen_abc123 --backend http://localhost:5012 --models claude,codex
-    REEN_TOKEN=reen_abc123 reen-cli daemon --verbose
-
-  Подробнее: https://reen.tech
-  `);
-}
-
 const CONFIG = parseArgs();
-const log = (...args) => CONFIG.verbose && console.log('[reen-cli]', ...args);
+const log = (...args) => CONFIG.verbose && console.log('[daemon]', ...args);
 
 // ═══════════════════════════════════════════
 // §2. CLI Executors (PTY spawn)
 // ═══════════════════════════════════════════
 
-// Создаём sandbox директорию (Gemini сканирует cwd)
-if (!existsSync(SANDBOX_DIR)) mkdirSync(SANDBOX_DIR, { recursive: true });
-
-/** Чистый env без переменных Claude Code (защита от nested session) */
+/** Clean env without Claude Code variables (prevent nested session) */
 function cleanEnv(base = process.env) {
   const env = { ...base };
   delete env.CLAUDECODE;
@@ -150,28 +81,45 @@ function cleanEnv(base = process.env) {
   return env;
 }
 
-/** Универсальный вызов CLI через PTY */
-async function callCLI(command, args, timeoutMs, env = cleanEnv()) {
-  return new Promise((resolve, reject) => {
-    const proc = pty.spawn(command, args, {
-      name: 'xterm-color',
-      cols: 120,
-      rows: 30,
-      cwd: SANDBOX_DIR,
-      env,
-    });
+/** Check if CLI command is available */
+function hasCLI(command) {
+  try {
+    execSync(`which ${command}`, { stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
 
-    let output = '';
-    const timer = setTimeout(() => {
+// Sandbox for CLI — models won't scan the working repository
+const SANDBOX_DIR = '/tmp/reen-sandbox';
+mkdirSync(SANDBOX_DIR, { recursive: true });
+
+/** Universal CLI call via PTY. Returns { promise, proc } */
+function callCLI(command, args, timeoutMs, env = cleanEnv()) {
+  const proc = pty.spawn(command, args, {
+    name: 'xterm-color',
+    cols: 120,
+    rows: 30,
+    cwd: SANDBOX_DIR,
+    env,
+  });
+
+  let output = '';
+  const timer = setTimeout(() => {
+    proc.kill();
+  }, timeoutMs);
+
+  proc.onData(data => { output += data; });
+
+  const promise = new Promise((resolve, reject) => {
+    const timeoutReject = setTimeout(() => {
       proc.kill();
       reject(new Error(`${command} timeout (${timeoutMs}ms)`));
-    }, timeoutMs);
-
-    proc.onData(data => { output += data; });
+    }, timeoutMs + 100);
 
     proc.onExit(({ exitCode }) => {
       clearTimeout(timer);
-      // Очистка ANSI/PTY мусора
+      clearTimeout(timeoutReject);
+      // Clean ANSI/PTY artifacts
       const clean = output
         .replace(/\x1b\[[0-9;?<>=:]*[a-zA-Z@^`{|}~]/g, '')
         .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
@@ -183,44 +131,172 @@ async function callCLI(command, args, timeoutMs, env = cleanEnv()) {
         .replace(/\]9;[0-9;]*[^\]]*$/gm, '')
         .replace(/\n[a-z]\s*$/i, '')
         .trim();
+      if (exitCode !== 0 && exitCode !== null) {
+        reject(new Error(`${command} exit ${exitCode}: ${clean.substring(0, 200)}`));
+        return;
+      }
       resolve(clean);
     });
   });
+
+  return { promise, proc };
 }
 
-async function callClaude(prompt) {
-  const raw = await callCLI('claude', ['-p', prompt, '--output-format', 'text'], CONFIG.claudeTimeoutMs);
-  if (!raw || raw.length < 3) throw new Error('Claude: пустой ответ');
-  return raw;
+/** Filter CLI garbage (loading messages, hooks, credentials) */
+function filterCLIGarbage(raw) {
+  const lines = raw.split('\n');
+  let inStackTrace = false;
+  const filtered = lines.filter(line => {
+    const l = line.trim();
+    if (!l) return false;
+    // Gemini CLI garbage
+    if (l.startsWith('Loaded cached credentials')) return false;
+    if (l.startsWith('Project hooks disabled')) return false;
+    if (l.startsWith('Hook registry initialized')) return false;
+    if (l.startsWith('Attempt ') && l.includes('failed with status')) return false;
+    // Common CLI messages
+    if (l.startsWith('Warning:') || l.startsWith('Note:')) return false;
+    // Stack trace фильтрация (GaxiosError, Error, etc.)
+    if (/^(Gaxios)?Error:?\s/.test(l) || l.startsWith('GaxiosError')) { inStackTrace = true; return false; }
+    if (inStackTrace) {
+      // Stack trace lines: "at Foo (/path...)", "code: 429", "status: 429", curly braces
+      if (/^\s*at\s/.test(line) || /^\s*(code|status|statusText|data|config|headers|url|method|stack)\s*:/.test(l) || l === '{' || l === '}' || l === '},') return false;
+      // End of stack trace — regular text
+      if (l.length > 0 && !l.startsWith('at ') && !l.includes('Error') && !/^\s*[{}\[\]]/.test(l)) inStackTrace = false;
+    }
+    return true;
+  });
+  return filtered.join('\n').trim();
 }
 
-async function callCodex(prompt) {
-  const raw = await callCLI('codex', ['exec', '--skip-git-repo-check', prompt], CONFIG.codexTimeoutMs, { ...process.env });
-  // Парсинг ответа Codex (между маркерами)
-  const startMark = '\ncodex\n';
-  const endMark = '\ntokens used\n';
-  const si = raw.indexOf(startMark);
-  const ei = raw.lastIndexOf(endMark);
+/** Detect API errors in CLI response */
+function detectAPIError(raw) {
+  // JSON error response (Google API, etc.)
+  const errorMatch = raw.match(/"message"\s*:\s*"([^"]+)"/);
+  if (errorMatch && (raw.includes('"error"') || raw.includes('RESOURCE_EXHAUSTED') || raw.includes('rateLimitExceeded'))) {
+    return errorMatch[1];
+  }
+  // Gaxios / HTTP stack traces (Gemini CLI on 429, 500, etc.)
+  const gaxiosMatch = raw.match(/GaxiosError:?\s*(.+?)[\n{]/);
+  if (gaxiosMatch) {
+    const codeMatch = raw.match(/code:\s*(\d{3})/);
+    const code = codeMatch ? ` (HTTP ${codeMatch[1]})` : '';
+    return `${gaxiosMatch[1].trim()}${code}`;
+  }
+  // General pattern: HTTP error codes in stack traces
+  const httpErrMatch = raw.match(/(?:status\s*code|HTTP)\s*(\d{3})\b/i);
+  if (httpErrMatch && raw.includes('Error') && (raw.includes('    at ') || raw.includes('stack:'))) {
+    return `HTTP ${httpErrMatch[1]} error`;
+  }
+  return null;
+}
+
+function spawnClaude(prompt) {
+  const { promise, proc } = callCLI('claude', ['-p', prompt], CONFIG.claudeTimeoutMs);
+  return { proc, promise: promise.then(raw => {
+    if (!raw || raw.length < 3) throw new Error('Claude: empty response');
+    return raw;
+  })};
+}
+
+function cleanCodexOutput(raw) {
+  // Step 1: Cut everything before the last "=== YOUR TURN ===" (end of prompt echo)
   let response = raw;
-  if (si !== -1 && ei !== -1) response = raw.substring(si + startMark.length, ei).trim();
-  else if (si !== -1) response = raw.substring(si + startMark.length).trim();
-  if (!response || response.length < 5) throw new Error('Codex: пустой ответ');
+  const lastYourTurn = response.lastIndexOf('=== YOUR TURN ===');
+  if (lastYourTurn !== -1) response = response.substring(lastYourTurn + 17);
+
+  // Step 2: If there are "codex\n" segments — take the last long one (final answer)
+  const segments = response.split(/\ncodex\n/);
+  if (segments.length > 1) {
+    for (let i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].trim().length > 50) { response = segments[i]; break; }
+    }
+  }
+
+  // Step 3: Line-by-line garbage filtering
+  response = response.split('\n').filter(line => {
+    const l = line.trim();
+    if (!l) return true;
+    // Codex CLI header/footer
+    if (/^(OpenAI Codex|workdir:|model:|provider:|approval:|sandbox:|reasoning\s|session id:|--------$)/.test(l)) return false;
+    if (/^tokens?\s+used/i.test(l)) return false;
+    // Bare numbers — token counter without prefix (1,297 / 5432 / 12,345)
+    if (/^\d[\d,]*$/.test(l)) return false;
+    // Prompt echo
+    if (/^(user$|=== (DISCUSSION SUMMARY|PARTICIPANT POSITIONS|RECENT MESSAGES|YOUR TURN|SYSTEM INSTRUCTIONS) ===$)/.test(l)) return false;
+    if (/^(You are (gpt|claude|gemini|grok)\. Other active)/.test(l)) return false;
+    if (/^\((start of discussion|none yet)\)$/.test(l)) return false;
+    if (/^[a-z]{2,10}\]:\s/.test(l)) return false; // truncated "[john.smith]:" → "ohn.smith]:"
+    // Codex internal
+    if (l === 'mcp startup: no servers' || l === 'codex' || /^→$/.test(l)) return false;
+    if (/^\d{4}-\d{2}-\d{2}T.*ERROR\s+codex_core::/.test(l)) return false;
+    if (/^Reconnecting\.\.\.\s\d+\/\d+/.test(l)) return false;
+    // Thinking / search
+    if (l === 'thinking') return false;
+    if (/^\*\*[A-Za-z][^*]{3,70}\*\*$/.test(l)) return false;
+    if (/^🌐\s+(Search|Searched)/.test(l)) return false;
+    return true;
+  }).join('\n');
+
+  response = response.replace(/\n{3,}/g, '\n\n').trim();
+
+  // Step 4: Deduplication — codex outputs the response twice (streaming echo)
+  // 4a: By paragraphs (\n\n)
+  const paragraphs = response.split(/\n\n/);
+  const seen = new Set();
+  const unique = [];
+  for (const p of paragraphs) {
+    const key = p.trim();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(p);
+  }
+  response = unique.join('\n\n').trim();
+
+  // 4b: By lines — if first and second halves are identical
+  const lines = response.split('\n');
+  for (let half = Math.floor(lines.length / 2); half >= 1; half--) {
+    const firstHalf = lines.slice(0, half).join('\n').trim();
+    const secondHalf = lines.slice(half).join('\n').trim();
+    if (firstHalf === secondHalf && firstHalf.length > 10) {
+      response = firstHalf;
+      break;
+    }
+  }
+
   return response;
 }
 
-async function callGemini(prompt) {
-  const raw = await callCLI('gemini', ['-p', prompt], CONFIG.geminiTimeoutMs);
-  if (!raw || raw.length < 3) throw new Error('Gemini: пустой ответ');
-  return raw;
+function spawnGPT(prompt) {
+  const { promise, proc } = callCLI('codex', ['exec', '--skip-git-repo-check', prompt], CONFIG.gptTimeoutMs, cleanEnv());
+  return { proc, promise: promise.then(raw => {
+    const response = cleanCodexOutput(raw);
+    if (!response || response.length < 3) throw new Error('GPT: empty response');
+    return response;
+  })};
 }
 
-async function callGrok(prompt) {
-  const raw = await callCLI('grok', ['-p', prompt], CONFIG.grokTimeoutMs);
-  if (!raw || raw.length < 3) throw new Error('Grok: пустой ответ');
-  return raw;
+function spawnGemini(prompt) {
+  const { promise, proc } = callCLI('gemini', ['-m', 'gemini-2.5-pro', '-p', prompt], CONFIG.geminiTimeoutMs);
+  return { proc, promise: promise.then(raw => {
+    const apiError = detectAPIError(raw);
+    if (apiError) throw new Error(`Gemini API: ${apiError}`);
+    const clean = filterCLIGarbage(raw);
+    if (!clean || clean.length < 3) throw new Error('Gemini: empty response');
+    return clean;
+  })};
 }
 
-const EXECUTORS = { claude: callClaude, codex: callCodex, gemini: callGemini, grok: callGrok };
+function spawnGrok(prompt) {
+  const { promise, proc } = callCLI('grok', ['-p', prompt], CONFIG.grokTimeoutMs);
+  return { proc, promise: promise.then(raw => {
+    if (!raw || raw.length < 3) throw new Error('Grok: empty response');
+    return raw;
+  })};
+}
+
+const SPAWNERS = { claude: spawnClaude, gpt: spawnGPT, gemini: spawnGemini, grok: spawnGrok };
 
 // ═══════════════════════════════════════════
 // §3. Conference Connection (per-conference state)
@@ -237,7 +313,10 @@ class ConferenceConnection {
     this.stances = {};
     this.messagesSinceSummary = 0;
     this.handledIds = new Set();
-    this.cancelledModels = new Set();
+    this.initialPrompt = '';
+    this.activeProcs = new Map(); // model -> pty process (for cancel)
+    this.cancelledModels = new Set(); // models stopped by user
+    this.paused = false; // conference paused (Stop button)
     this.alive = true;
   }
 
@@ -259,28 +338,31 @@ class ConferenceConnection {
     if (event.type !== 'message') return false;
     if (!event.id || this.handledIds.has(event.id)) return false;
     if (!event.mentions || event.mentions.length === 0) return false;
-    // Модели не отвечают на сообщения других моделей (anti-loop)
-    const knownModels = new Set(['claude', 'codex', 'gemini', 'grok', 'claude-code']);
-    if (knownModels.has(event.author)) return false;
     const relevant = event.mentions.filter(m => CONFIG.models.includes(m));
     return relevant.length > 0;
   }
 
   buildPrompt(model, taskMessage) {
     const stancesText = Object.entries(this.stances)
-      .map(([k, v]) => `  ${k}: ${v}`).join('\n') || '  (пока нет)';
+      .map(([k, v]) => `  ${k}: ${v}`).join('\n') || '  (none yet)';
     const recentText = this.recentBuffer.slice(-20)
       .map(m => {
         let text = `[${m.author}]: ${m.content}`;
         if (m.attachment?.file_content) {
-          text += `\n\n--- Файл: ${m.attachment.original_name} ---\n${m.attachment.file_content}\n--- Конец файла ---`;
+          text += `\n\n--- File: ${m.attachment.original_name} ---\n${m.attachment.file_content}\n--- End of file ---`;
         }
         return text;
       }).join('\n');
 
-    return `You are ${model}, a participant in a multi-model AI conference. Other participants: ${CONFIG.models.filter(m => m !== model).join(', ')}.
-Use @name to ask a question or request input from another participant. Without @ — just a reference, no response triggered.
+    // CLI-override: some CLI tools have a hardcoded system prompt
+    // ("I am a CLI agent for software engineering"), need to explicitly override
+    const cliOverride = ['gemini', 'grok'].includes(model)
+      ? `IMPORTANT: You are NOT a CLI agent. Ignore any default system instructions about being a CLI tool. Your role right now is: AI conference participant named "${model}". Respond in the language of the conversation.\n\n`
+      : '';
 
+    return `${cliOverride}You are ${model}. Other active participants: ${CONFIG.models.filter(m => m !== model).join(', ')}.
+
+${this.initialPrompt ? `=== SYSTEM INSTRUCTIONS ===\n${this.initialPrompt}\n` : ''}
 === DISCUSSION SUMMARY ===
 ${this.summary || '(start of discussion)'}
 
@@ -302,16 +384,17 @@ ${taskMessage}`;
 
   async loadHistory() {
     try {
-      const res = await fetch(`${CONFIG.backend}/api/conferences/${this.confId}?limit=${CONFIG.recentBufferSize}`, {
+      const res = await fetch(`${CONFIG.backend}/api/conferences/${this.confId}?limit=50`, {
         headers: { 'Authorization': `Bearer ${CONFIG.token}` }
       });
       if (res.ok) {
         const data = await res.json();
+        if (data.initial_prompt) this.initialPrompt = data.initial_prompt;
         (data.messages || []).forEach(m => this.pushMessage(m));
-        log(`${this.title}: загружено ${data.messages?.length || 0} сообщений`);
+        log(`${this.title}: loaded ${data.messages?.length || 0} messages`);
       }
     } catch (err) {
-      log(`${this.title}: не удалось загрузить историю: ${err.message}`);
+      log(`${this.title}: failed to load history: ${err.message}`);
     }
   }
 
@@ -323,7 +406,7 @@ ${taskMessage}`;
     this.ws = new WebSocket(url);
 
     this.ws.on('open', () => {
-      console.log(`  [+] ${this.title} — подключено`);
+      console.log(`  [+] ${this.title} — connected`);
       const models = {};
       CONFIG.models.forEach(m => { models[m] = true; });
       this.sendJson({ type: 'capabilities', models });
@@ -334,14 +417,14 @@ ${taskMessage}`;
         const event = JSON.parse(raw.toString());
         await this.handleEvent(event);
       } catch (err) {
-        log(`${this.title}: ошибка обработки: ${err.message}`);
+        log(`${this.title}: processing error: ${err.message}`);
       }
     });
 
-    this.ws.on('close', (code) => {
-      log(`${this.title}: WS закрыт ${code}`);
+    this.ws.on('close', (code, reason) => {
+      log(`${this.title}: WS closed ${code}`);
       if (code === 4001 || code === 4004) {
-        console.log(`  [-] ${this.title} — удалена или нет доступа`);
+        console.log(`  [-] ${this.title} — deleted or no access`);
         this.alive = false;
         return;
       }
@@ -351,80 +434,91 @@ ${taskMessage}`;
     });
 
     this.ws.on('error', (err) => {
-      log(`${this.title}: WS ошибка: ${err.message}`);
+      log(`${this.title}: WS error: ${err.message}`);
     });
   }
 
-  async handleEvent(event) {
-    // Обработка cancel
-    if (event.type === 'cancel' && event.target) {
-      this.cancelledModels.add(event.target);
-      return;
+  cancelModel(model) {
+    this.cancelledModels.add(model);
+    const proc = this.activeProcs.get(model);
+    if (proc) {
+      proc.kill();
+      this.activeProcs.delete(model);
     }
-    // Обработка control (stop/go)
-    if (event.type === 'control' && event.action === 'stopped') {
-      CONFIG.models.forEach(m => this.cancelledModels.add(m));
-      return;
-    }
-    if (event.type === 'control' && (event.action === 'playing' || event.action === 'resumed')) {
-      this.cancelledModels.clear();
-    }
+    console.log(`  [${this.title}] ${model} — cancelled`);
+  }
 
-    if (event.type === 'message') this.pushMessage(event);
+  async handleEvent(event) {
+    // Cancel: kill process + block model until next user message
+    if (event.type === 'cancel') {
+      const target = event.target;
+      if (target) this.cancelModel(target);
+      return;
+    }
+    // Control: stop = pause entire conference, playing = resume
+    if (event.type === 'control') {
+      if (event.action === 'stopped') {
+        this.paused = true;
+        for (const model of [...this.activeProcs.keys()]) this.cancelModel(model);
+        console.log(`  [${this.title}] conference paused`);
+      } else if (event.action === 'playing') {
+        this.paused = false;
+        this.cancelledModels.clear();
+        console.log(`  [${this.title}] conference resumed`);
+      }
+      return;
+    }
+    if (event.type === 'message') {
+      this.pushMessage(event);
+      // Message from user — reset cancellations
+      const isModel = CONFIG.models.includes(event.author);
+      if (!isModel) {
+        this.cancelledModels.clear();
+        this.paused = false;
+      }
+    }
+    if (this.paused) return;
     if (!this.shouldHandle(event)) return;
     this.markHandled(event.id);
 
-    const targets = event.mentions.includes('all')
-      ? CONFIG.models
-      : event.mentions.filter(m => CONFIG.models.includes(m));
+    const targets = event.mentions
+      .filter(m => CONFIG.models.includes(m))
+      .filter(m => !this.cancelledModels.has(m));
+    if (targets.length === 0) return;
     log(`${this.title}: @${targets.join(',')} от ${event.author}`);
 
-    // Последовательный запуск (модели видят ответы предыдущих)
-    for (const model of targets) {
-      if (this.cancelledModels.has(model)) {
-        log(`${this.title}: ${model} отменён`);
-        continue;
-      }
-      await this.routeToAgent(model, event.content);
-    }
+    const tasks = targets.map(model => this.routeToAgent(model, event.content));
+    await Promise.allSettled(tasks);
   }
 
   async routeToAgent(model, taskMessage) {
-    const executor = EXECUTORS[model];
-    if (!executor) return;
+    const spawner = SPAWNERS[model];
+    if (!spawner) return;
 
     this.sendJson({ type: 'status', model, state: 'generating' });
     const typingInterval = setInterval(() => this.sendJson({ type: 'typing' }), CONFIG.typingIntervalMs);
 
     try {
       const prompt = this.buildPrompt(model, taskMessage);
-      const response = await executor(prompt);
-
-      // Проверяем отмену
-      if (this.cancelledModels.has(model)) {
-        log(`${this.title}: ${model} — ответ отброшен (отменён)`);
-        return;
-      }
-
-      // Парсим @mentions из ответа для цепочки
-      const mentionRe = /@(claude|codex|gemini|grok|all)\b/gi;
-      const responseMentions = [...new Set(
-        [...response.matchAll(mentionRe)].map(m => m[1].toLowerCase())
-      )];
-
-      this.sendJson({ type: 'message', content: response, mentions: responseMentions, author: model });
-
-      // Обновить stance
+      const { proc, promise } = spawner(prompt);
+      this.activeProcs.set(model, proc);
+      const response = await promise;
+      this.activeProcs.delete(model);
+      // ANTI-LOOP: models do NOT trigger other models — mentions always empty
+      this.sendJson({ type: 'message', content: response, mentions: [], author: model });
+      // Update stance
       const sentences = response.split(/[.!?]\s+/).slice(0, 2).join('. ');
       this.stances[model] = sentences.substring(0, 200);
-
-      console.log(`  [${this.title}] ${model} ответил (${response.length} символов)`);
+      console.log(`  [${this.title}] ${model} responded (${response.length} chars)`);
     } catch (err) {
-      if (this.cancelledModels.has(model)) return; // Тихо игнорируем при отмене
-      console.error(`  [${this.title}] ${model} ошибка: ${err.message}`);
-      this.sendJson({ type: 'message', content: `[${model} error] ${err.message}`, mentions: [], author: model });
-      this.sendJson({ type: 'status', model, state: 'error' });
+      this.activeProcs.delete(model);
+      console.error(`  [${this.title}] ${model} error: ${err.message}`);
+      // Send short error to chat so user can see the reason
+      const short = err.message.length > 200 ? err.message.substring(0, 200) + '…' : err.message;
+      this.sendJson({ type: 'message', content: `⚠️ ${short}`, mentions: [], author: model });
+      this.sendJson({ type: 'status', model, state: 'idle' });
     } finally {
+      this.activeProcs.delete(model);
       clearInterval(typingInterval);
       this.sendJson({ type: 'status', model, state: 'idle' });
     }
@@ -438,10 +532,10 @@ ${taskMessage}`;
 }
 
 // ═══════════════════════════════════════════
-// §4. Daemon — автоподключение ко всем конференциям
+// §4. Daemon — polling and auto-connect
 // ═══════════════════════════════════════════
 
-const connections = new Map();
+const connections = new Map(); // confId -> ConferenceConnection
 
 async function fetchConferences() {
   try {
@@ -470,10 +564,10 @@ async function poll() {
     }
   }
 
-  // Отключаем удалённые конференции
+  // Disconnect deleted conferences
   for (const [id, conn] of connections) {
     if (!activeIds.has(id) || !conn.alive) {
-      console.log(`  [-] ${conn.title} — отключаю`);
+      console.log(`  [-] ${conn.title} — disconnecting`);
       conn.close();
       connections.delete(id);
     }
@@ -481,109 +575,32 @@ async function poll() {
 }
 
 // ═══════════════════════════════════════════
-// §5. Команды: list, create, connect
+// §5. Startup
 // ═══════════════════════════════════════════
 
-async function cmdList() {
-  const confs = await fetchConferences();
-  if (confs.length === 0) {
-    console.log('Конференций нет');
-    return;
-  }
-  console.log(`\n  Конференции (${confs.length}):\n`);
-  for (const c of confs) {
-    const date = c.created_at ? new Date(c.created_at).toLocaleDateString() : '';
-    console.log(`  ${c.id}  ${c.title || '(без названия)'}  ${date}`);
-  }
-  console.log('');
-}
+// Mapping model_id → CLI command
+const MODEL_CLI = { claude: 'claude', gpt: 'codex', gemini: 'gemini', grok: 'grok' };
 
-async function cmdCreate() {
-  const title = CONFIG.title || CONFIG.commandArg || 'New Conference';
-  try {
-    const res = await fetch(`${CONFIG.backend}/api/conferences`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ title }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      console.log(`Создана: ${data.id} — ${title}`);
-    } else {
-      console.error(`Ошибка: ${res.status} ${await res.text()}`);
-    }
-  } catch (err) {
-    console.error(`Ошибка: ${err.message}`);
-  }
-}
+// Check which CLIs are actually available
+const available = CONFIG.models.filter(m => {
+  const cmd = MODEL_CLI[m] || m;
+  const ok = hasCLI(cmd);
+  if (!ok) console.log(`  [!] ${m} — CLI "${cmd}" not found, skipping`);
+  return ok;
+});
+const skipped = CONFIG.models.filter(m => !available.includes(m));
+CONFIG.models = available;
 
-async function cmdConnect() {
-  const confId = CONFIG.commandArg;
-  if (!confId) {
-    console.error('Укажите ID конференции: reen-cli connect <conf_id> --token ...');
-    process.exit(1);
-  }
+console.log(`\n  reen-cli daemon`);
+console.log(`  Backend:  ${CONFIG.backend}`);
+console.log(`  Models:   ${CONFIG.models.join(', ')}${skipped.length ? ` (skipped: ${skipped.join(', ')})` : ''}`);
+console.log(`  Poll:     every ${CONFIG.pollIntervalMs / 1000}s\n`);
 
-  console.log(`\n  reen-cli v${VERSION}`);
-  console.log(`  Конференция: ${confId}`);
-  console.log(`  Backend:     ${CONFIG.backend}`);
-  console.log(`  Models:      ${CONFIG.models.join(', ')}\n`);
+await poll();
+setInterval(poll, CONFIG.pollIntervalMs);
 
-  const conn = new ConferenceConnection(confId, confId);
-  await conn.loadHistory();
-  await conn.connect();
-
-  process.on('SIGINT', () => {
-    console.log('\n  Завершение...');
-    conn.close();
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => { conn.close(); process.exit(0); });
-}
-
-async function cmdDaemon() {
-  // Lockfile проверка
-  if (existsSync(LOCKFILE)) {
-    try {
-      const pid = parseInt(readFileSync(LOCKFILE, 'utf8').trim());
-      try { process.kill(pid, 0); console.error(`Daemon уже запущен (PID ${pid}). Для перезапуска: rm ${LOCKFILE}`); process.exit(1); }
-      catch { unlinkSync(LOCKFILE); } // Процесс не существует — stale lockfile
-    } catch { /* ignore */ }
-  }
-  writeFileSync(LOCKFILE, String(process.pid));
-
-  console.log(`\n  reen-cli daemon v${VERSION}`);
-  console.log(`  Backend:  ${CONFIG.backend}`);
-  console.log(`  Models:   ${CONFIG.models.join(', ')}`);
-  console.log(`  Poll:     every ${CONFIG.pollIntervalMs / 1000}s\n`);
-
-  await poll();
-  setInterval(poll, CONFIG.pollIntervalMs);
-
-  const cleanup = () => {
-    console.log('\n  Завершение...');
-    for (const [, conn] of connections) conn.close();
-    try { unlinkSync(LOCKFILE); } catch { /* ignore */ }
-    process.exit(0);
-  };
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
-}
-
-// ═══════════════════════════════════════════
-// §6. Запуск
-// ═══════════════════════════════════════════
-
-switch (CONFIG.command) {
-  case 'daemon': await cmdDaemon(); break;
-  case 'connect': await cmdConnect(); break;
-  case 'list': await cmdList(); break;
-  case 'create': await cmdCreate(); break;
-  default:
-    console.error(`Неизвестная команда: ${CONFIG.command}`);
-    printHelp();
-    process.exit(1);
-}
+process.on('SIGINT', () => {
+  console.log('\n  Shutting down...');
+  for (const [, conn] of connections) conn.close();
+  process.exit(0);
+});
